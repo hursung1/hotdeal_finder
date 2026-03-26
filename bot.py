@@ -74,8 +74,8 @@ async def on_ready():
     if not crawler_task.is_running():
         crawler_task.start()
 
-# 5분마다 실행되는 백그라운드 스케줄러
-@tasks.loop(minutes=5)
+# 10분마다 실행되는 백그라운드 스케줄러
+@tasks.loop(minutes=10)
 async def crawler_task():
     if not ALERT_CHANNEL_ID:
         print("❗ 경고: DISCORD_ALERT_CHANNEL_ID가 설정되지 않아 크롤링 알림을 쏠 수 없습니다.")
@@ -201,7 +201,7 @@ async def search_hotdeal(interaction: discord.Interaction, keyword: str, limit: 
             fmkorea_deals, blocked = await collect_fmkorea_recent_deals(days=SEARCH_WINDOW_DAYS)
             all_deals.extend(fmkorea_deals)
             if blocked:
-                crawl_errors.append("펨코: 보안 시스템으로 수집 차단됨 (FMKOREA_COOKIE 설정 필요)")
+                crawl_errors.append("펨코: HTTP/브라우저 수집 모두 차단됨")
         except Exception as e:
             crawl_errors.append(f"펨코: {e}")
 
