@@ -1,4 +1,5 @@
 import os
+import asyncio
 import datetime
 import requests
 from bs4 import BeautifulSoup
@@ -17,6 +18,7 @@ HEADERS = {
 }
 UTC = datetime.timezone.utc
 KST = ZoneInfo("Asia/Seoul")
+FMKOREA_PLAYWRIGHT_SEMAPHORE = asyncio.Semaphore(1)
 
 def normalize_link(base_url, href):
     if not href:
@@ -182,115 +184,115 @@ def extract_fmkorea_row_date_text(row):
 def collect_ruliweb_recent_deals(days=30, max_pages=400):
     now_kst = datetime.datetime.now(KST)
     cutoff_utc = _recent_cutoff_utc(days=days)
-    session = requests.Session()
     items = []
 
-    for page in range(1, max_pages + 1):
-        target_url = f"{URL}?page={page}"
-        res = session.get(target_url, headers=HEADERS, timeout=20)
-        res.raise_for_status()
-        soup = BeautifulSoup(res.text, "html.parser")
-        rows = soup.select("tr.table_body")
-        if not rows:
-            break
+    with requests.Session() as session:
+        for page in range(1, max_pages + 1):
+            target_url = f"{URL}?page={page}"
+            res = session.get(target_url, headers=HEADERS, timeout=20)
+            res.raise_for_status()
+            soup = BeautifulSoup(res.text, "html.parser")
+            rows = soup.select("tr.table_body")
+            if not rows:
+                break
 
-        page_has_recent_post = False
-        for row in rows:
-            row_classes = row.get("class", [])
-            if "notice" in row_classes or "best" in row_classes:
-                continue
+            page_has_recent_post = False
+            for row in rows:
+                row_classes = row.get("class", [])
+                if "notice" in row_classes or "best" in row_classes:
+                    continue
 
-            title_tag = row.select_one("td.subject a.deco")
-            date_tag = row.select_one("td.time")
-            if not title_tag or not date_tag:
-                continue
+                title_tag = row.select_one("td.subject a.deco")
+                date_tag = row.select_one("td.time")
+                if not title_tag or not date_tag:
+                    continue
 
-            posted_at = parse_ruliweb_datetime(date_tag.get_text(" ", strip=True), now_kst)
-            if posted_at is None:
-                continue
+                posted_at = parse_ruliweb_datetime(date_tag.get_text(" ", strip=True), now_kst)
+                if posted_at is None:
+                    continue
 
-            if posted_at >= cutoff_utc:
-                page_has_recent_post = True
-            else:
-                continue
+                if posted_at >= cutoff_utc:
+                    page_has_recent_post = True
+                else:
+                    continue
 
-            title = _normalize_title(title_tag.get_text(" ", strip=True))
-            link = normalize_link(URL, title_tag.get("href"))
-            if not title or not link:
-                continue
+                title = _normalize_title(title_tag.get_text(" ", strip=True))
+                link = normalize_link(URL, title_tag.get("href"))
+                if not title or not link:
+                    continue
 
-            items.append(
-                {
-                    "title": title,
-                    "link": link,
-                    "price": extract_price(title),
-                    "posted_at": _to_aware_utc(posted_at),
-                }
-            )
+                items.append(
+                    {
+                        "title": title,
+                        "link": link,
+                        "price": extract_price(title),
+                        "posted_at": _to_aware_utc(posted_at),
+                    }
+                )
 
-        if not page_has_recent_post:
-            break
+            if not page_has_recent_post:
+                break
 
     return items
 
 def collect_arcalive_recent_deals(days=30, max_pages=400):
     cutoff_utc = _recent_cutoff_utc(days=days)
-    scraper = cloudscraper.create_scraper()
     items = []
 
-    for page in range(1, max_pages + 1):
-        target_url = f"{ARCALIVE_BOARD_URL}?p={page}"
-        res = scraper.get(target_url, headers=HEADERS, timeout=20)
-        res.raise_for_status()
-        soup = BeautifulSoup(res.text, "html.parser")
-        rows = soup.select(".vrow.hybrid, a.vrow.column:not(.notice)")
-        if not rows:
-            break
+    with cloudscraper.create_scraper() as scraper:
+        for page in range(1, max_pages + 1):
+            target_url = f"{ARCALIVE_BOARD_URL}?p={page}"
+            res = scraper.get(target_url, headers=HEADERS, timeout=20)
+            res.raise_for_status()
+            soup = BeautifulSoup(res.text, "html.parser")
+            rows = soup.select(".vrow.hybrid, a.vrow.column:not(.notice)")
+            if not rows:
+                break
 
-        page_has_recent_post = False
-        for row in rows:
-            title_tag = row.select_one("a.title.hybrid-title, a.title")
-            time_tag = row.select_one("time[datetime]")
-            if not title_tag or not time_tag:
-                continue
+            page_has_recent_post = False
+            for row in rows:
+                title_tag = row.select_one("a.title.hybrid-title, a.title")
+                time_tag = row.select_one("time[datetime]")
+                if not title_tag or not time_tag:
+                    continue
 
-            iso_dt = time_tag.get("datetime")
-            if not iso_dt:
-                continue
+                iso_dt = time_tag.get("datetime")
+                if not iso_dt:
+                    continue
 
-            try:
-                posted_at = datetime.datetime.fromisoformat(iso_dt.replace("Z", "+00:00")).astimezone(UTC)
-            except ValueError:
-                continue
+                try:
+                    posted_at = datetime.datetime.fromisoformat(iso_dt.replace("Z", "+00:00")).astimezone(UTC)
+                except ValueError:
+                    continue
 
-            if posted_at >= cutoff_utc:
-                page_has_recent_post = True
-            else:
-                continue
+                if posted_at >= cutoff_utc:
+                    page_has_recent_post = True
+                else:
+                    continue
 
-            title = _normalize_title(title_tag.get_text(" ", strip=True))
-            link = normalize_link("https://arca.live", title_tag.get("href") or row.get("href"))
-            if not title or not link:
-                continue
+                title = _normalize_title(title_tag.get_text(" ", strip=True))
+                link = normalize_link("https://arca.live", title_tag.get("href") or row.get("href"))
+                if not title or not link:
+                    continue
 
-            price = None
-            price_tag = row.select_one(".deal-price")
-            if price_tag:
-                price = extract_price(price_tag.get_text(" ", strip=True))
-            if price is None:
-                price = extract_price(title)
+                price = None
+                price_tag = row.select_one(".deal-price")
+                if price_tag:
+                    price = extract_price(price_tag.get_text(" ", strip=True))
+                if price is None:
+                    price = extract_price(title)
 
-            items.append(
-                {
-                    "title": title,
-                    "link": link,
-                    "price": price,
-                    "posted_at": _to_aware_utc(posted_at),
-                }
-            )
+                items.append(
+                    {
+                        "title": title,
+                        "link": link,
+                        "price": price,
+                        "posted_at": _to_aware_utc(posted_at),
+                    }
+                )
 
-        if not page_has_recent_post:
-            break
+            if not page_has_recent_post:
+                break
 
     return items
 
@@ -300,159 +302,161 @@ async def collect_fmkorea_recent_deals(days=30, max_pages=400):
     items = []
     blocked = False
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
+    async with FMKOREA_PLAYWRIGHT_SEMAPHORE:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
 
-        cookie_header = os.getenv("FMKOREA_COOKIE")
-        if cookie_header:
-            await page.set_extra_http_headers({"Cookie": cookie_header})
+            cookie_header = os.getenv("FMKOREA_COOKIE")
+            if cookie_header:
+                await page.set_extra_http_headers({"Cookie": cookie_header})
 
-        try:
-            for page_num in range(1, max_pages + 1):
-                target_url = f"{FMKOREA_URL}?page={page_num}"
-                await page.goto(target_url, timeout=25000)
-                await page.wait_for_timeout(1500)
+            try:
+                for page_num in range(1, max_pages + 1):
+                    target_url = f"{FMKOREA_URL}?page={page_num}"
+                    await page.goto(target_url, timeout=25000)
+                    await page.wait_for_timeout(1500)
 
-                page_title = await page.title()
-                if "보안 시스템" in page_title:
-                    blocked = True
-                    break
+                    page_title = await page.title()
+                    if "보안 시스템" in page_title:
+                        blocked = True
+                        break
 
-                html = await page.content()
-                soup = BeautifulSoup(html, "html.parser")
-                anchors = soup.select("a.hotdeal_var8, td.title > a, a.title")
-                if not anchors:
-                    break
+                    html = await page.content()
+                    soup = BeautifulSoup(html, "html.parser")
+                    anchors = soup.select("a.hotdeal_var8, td.title > a, a.title")
+                    if not anchors:
+                        break
 
-                page_has_recent_post = False
-                page_seen_urls = set()
+                    page_has_recent_post = False
+                    page_seen_urls = set()
 
-                for anchor in anchors:
-                    title = _normalize_title(anchor.get_text(" ", strip=True))
-                    link = normalize_link(FMKOREA_URL, anchor.get("href"))
-                    if not title or not link or link in page_seen_urls:
-                        continue
-                    page_seen_urls.add(link)
+                    for anchor in anchors:
+                        title = _normalize_title(anchor.get_text(" ", strip=True))
+                        link = normalize_link(FMKOREA_URL, anchor.get("href"))
+                        if not title or not link or link in page_seen_urls:
+                            continue
+                        page_seen_urls.add(link)
 
-                    row = anchor.find_parent("tr")
-                    date_text = extract_fmkorea_row_date_text(row)
-                    posted_at = parse_fmkorea_datetime(date_text, now_kst)
-                    if posted_at is None:
-                        continue
+                        row = anchor.find_parent("tr")
+                        date_text = extract_fmkorea_row_date_text(row)
+                        posted_at = parse_fmkorea_datetime(date_text, now_kst)
+                        if posted_at is None:
+                            continue
 
-                    if posted_at >= cutoff_utc:
-                        page_has_recent_post = True
-                    else:
-                        continue
+                        if posted_at >= cutoff_utc:
+                            page_has_recent_post = True
+                        else:
+                            continue
 
-                    items.append(
-                        {
-                            "title": title,
-                            "link": link,
-                            "price": extract_price(title),
-                            "posted_at": _to_aware_utc(posted_at),
-                        }
-                    )
+                        items.append(
+                            {
+                                "title": title,
+                                "link": link,
+                                "price": extract_price(title),
+                                "posted_at": _to_aware_utc(posted_at),
+                            }
+                        )
 
-                if not page_has_recent_post:
-                    break
-        finally:
-            await browser.close()
+                    if not page_has_recent_post:
+                        break
+            finally:
+                await browser.close()
 
     return items, blocked
 
 async def parse_fmkorea():
     items = []
     # Playwright를 이용해 동적으로 페이지 접근
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        
-        try:
-            cookie_header = os.getenv("FMKOREA_COOKIE")
-            if cookie_header:
-                await page.set_extra_http_headers({"Cookie": cookie_header})
-
-            # 펨코 핫딜 게시판으로 이동
-            await page.goto(FMKOREA_URL, timeout=20000)
-            await page.wait_for_timeout(2000)
-
-            page_title = await page.title()
-            if "보안 시스템" in page_title:
-                print("펨코 크롤링 차단됨: 보안 시스템 페이지가 표시되어 게시글을 수집할 수 없습니다. 필요하면 FMKOREA_COOKIE 환경 변수를 설정해 주세요.")
-                return []
+    async with FMKOREA_PLAYWRIGHT_SEMAPHORE:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
             
-            # 게시물 리스트 추출
-            # 펨코 프론트 구조가 바뀔 수 있어 선택자를 순차적으로 시도합니다.
-            selectors = ["a.hotdeal_var8", ".hotdeal_var8", "a.title"]
-            elements = []
-            for selector in selectors:
-                elements = await page.query_selector_all(selector)
-                if elements:
-                    break
-            
-            seen = set()
-            for elem in elements:
-                title = await elem.inner_text()
-                href = await elem.get_attribute("href")
+            try:
+                cookie_header = os.getenv("FMKOREA_COOKIE")
+                if cookie_header:
+                    await page.set_extra_http_headers({"Cookie": cookie_header})
+
+                # 펨코 핫딜 게시판으로 이동
+                await page.goto(FMKOREA_URL, timeout=20000)
+                await page.wait_for_timeout(2000)
+
+                page_title = await page.title()
+                if "보안 시스템" in page_title:
+                    print("펨코 크롤링 차단됨: 보안 시스템 페이지가 표시되어 게시글을 수집할 수 없습니다. 필요하면 FMKOREA_COOKIE 환경 변수를 설정해 주세요.")
+                    return []
                 
-                link = normalize_link(FMKOREA_URL, href)
-                if not link or link in seen:
-                    continue
-                seen.add(link)
+                # 게시물 리스트 추출
+                # 펨코 프론트 구조가 바뀔 수 있어 선택자를 순차적으로 시도합니다.
+                selectors = ["a.hotdeal_var8", ".hotdeal_var8", "a.title"]
+                elements = []
+                for selector in selectors:
+                    elements = await page.query_selector_all(selector)
+                    if elements:
+                        break
+                
+                seen = set()
+                for elem in elements:
+                    title = await elem.inner_text()
+                    href = await elem.get_attribute("href")
                     
-                price = extract_price(title)
-                
-                if title and link:
-                    items.append({
-                        "title": title.strip(),
-                        "link": link,
-                        "price": price
-                    })
-        except Exception as e:
-            print(f"펨코 크롤링 실패: {e}")
-        finally:
-            await browser.close()
+                    link = normalize_link(FMKOREA_URL, href)
+                    if not link or link in seen:
+                        continue
+                    seen.add(link)
+                        
+                    price = extract_price(title)
+                    
+                    if title and link:
+                        items.append({
+                            "title": title.strip(),
+                            "link": link,
+                            "price": price
+                        })
+            except Exception as e:
+                print(f"펨코 크롤링 실패: {e}")
+            finally:
+                await browser.close()
             
     return items
 
 def parse_arcalive():
     items = []
-    scraper = cloudscraper.create_scraper()
-    try:
-        html = scraper.get(ARCALIVE_URL, headers=HEADERS, timeout=20).text
-        soup = BeautifulSoup(html, 'html.parser')
+    with cloudscraper.create_scraper() as scraper:
+        try:
+            html = scraper.get(ARCALIVE_URL, headers=HEADERS, timeout=20).text
+            soup = BeautifulSoup(html, 'html.parser')
 
-        # 최신 DOM은 ".vrow.hybrid" 구조이므로 제목 링크를 기준으로 수집합니다.
-        for vrow in soup.select('.vrow.hybrid, a.vrow.column:not(.notice)'):
-            title_tag = vrow.select_one('a.title.hybrid-title, a.title')
-            if not title_tag:
-                continue
+            # 최신 DOM은 ".vrow.hybrid" 구조이므로 제목 링크를 기준으로 수집합니다.
+            for vrow in soup.select('.vrow.hybrid, a.vrow.column:not(.notice)'):
+                title_tag = vrow.select_one('a.title.hybrid-title, a.title')
+                if not title_tag:
+                    continue
 
-            raw_title = title_tag.get_text(" ", strip=True)
-            title = " ".join(raw_title.split())
-            if not title:
-                continue
+                raw_title = title_tag.get_text(" ", strip=True)
+                title = " ".join(raw_title.split())
+                if not title:
+                    continue
 
-            link = normalize_link("https://arca.live", title_tag.get('href') or vrow.get('href'))
-            if not link:
-                continue
+                link = normalize_link("https://arca.live", title_tag.get('href') or vrow.get('href'))
+                if not link:
+                    continue
 
-            price = None
-            price_tag = vrow.select_one(".deal-price")
-            if price_tag:
-                price = extract_price(price_tag.get_text(" ", strip=True))
-            if price is None:
-                price = extract_price(title)
-            
-            items.append({
-                "title": title,
-                "link": link,
-                "price": price
-            })
-    except Exception as e:
-        print(f"아카라이브 크롤링 실패: {e}")
+                price = None
+                price_tag = vrow.select_one(".deal-price")
+                if price_tag:
+                    price = extract_price(price_tag.get_text(" ", strip=True))
+                if price is None:
+                    price = extract_price(title)
+                
+                items.append({
+                    "title": title,
+                    "link": link,
+                    "price": price
+                })
+        except Exception as e:
+            print(f"아카라이브 크롤링 실패: {e}")
         
     return items
 

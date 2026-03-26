@@ -1,4 +1,5 @@
 import os
+import asyncio
 import datetime
 import discord
 from discord.ext import commands, tasks
@@ -27,6 +28,7 @@ intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 KST = datetime.timezone(datetime.timedelta(hours=9))
 SEARCH_WINDOW_DAYS = 15
+SEARCH_SEMAPHORE = asyncio.Semaphore(1)
 
 # DB 세션 헬퍼 함수
 def get_db_session():
@@ -176,87 +178,91 @@ async def remove_keyword(interaction: discord.Interaction, name: str):
     limit="표시할 최대 게시글 수 (기본 5, 최대 10)"
 )
 async def search_hotdeal(interaction: discord.Interaction, keyword: str, limit: app_commands.Range[int, 1, 10] = 5):
-    await interaction.response.defer(thinking=True)
-
     if not keyword.strip():
-        await interaction.followup.send("❌ 검색어를 입력해주세요.", ephemeral=True)
+        await interaction.response.send_message("❌ 검색어를 입력해주세요.", ephemeral=True)
         return
 
-    all_deals = []
-    crawl_errors = []
+    if SEARCH_SEMAPHORE.locked():
+        await interaction.response.send_message("⏳ 다른 핫딜검색이 실행 중입니다. 잠시 후 다시 시도해주세요.", ephemeral=True)
+        return
 
-    try:
-        all_deals.extend(collect_ruliweb_recent_deals(days=SEARCH_WINDOW_DAYS))
-    except Exception as e:
-        crawl_errors.append(f"루리웹: {e}")
+    await interaction.response.defer(thinking=True)
 
-    try:
-        fmkorea_deals, blocked = await collect_fmkorea_recent_deals(days=SEARCH_WINDOW_DAYS)
-        all_deals.extend(fmkorea_deals)
-        if blocked:
-            crawl_errors.append("펨코: 보안 시스템으로 수집 차단됨 (FMKOREA_COOKIE 설정 필요)")
-    except Exception as e:
-        crawl_errors.append(f"펨코: {e}")
+    async with SEARCH_SEMAPHORE:
+        all_deals = []
+        crawl_errors = []
 
-    try:
-        all_deals.extend(collect_arcalive_recent_deals(days=SEARCH_WINDOW_DAYS))
-    except Exception as e:
-        crawl_errors.append(f"아카라이브: {e}")
+        try:
+            all_deals.extend(collect_ruliweb_recent_deals(days=SEARCH_WINDOW_DAYS))
+        except Exception as e:
+            crawl_errors.append(f"루리웹: {e}")
 
-    matched = []
-    seen_links = set()
-    for deal in all_deals:
-        title = (deal.get("title") or "").strip()
-        link = (deal.get("link") or "").strip()
-        if not title or not link:
-            continue
-        if link in seen_links:
-            continue
-        if not _is_query_match(title, keyword):
-            continue
-        seen_links.add(link)
-        matched.append({
-            "title": title,
-            "link": link,
-            "price": deal.get("price"),
-            "platform": _platform_name(link),
-            "posted_at": deal.get("posted_at"),
-        })
+        try:
+            fmkorea_deals, blocked = await collect_fmkorea_recent_deals(days=SEARCH_WINDOW_DAYS)
+            all_deals.extend(fmkorea_deals)
+            if blocked:
+                crawl_errors.append("펨코: 보안 시스템으로 수집 차단됨 (FMKOREA_COOKIE 설정 필요)")
+        except Exception as e:
+            crawl_errors.append(f"펨코: {e}")
 
-    matched.sort(
-        key=lambda x: x["posted_at"] if x.get("posted_at") else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc),
-        reverse=True
-    )
+        try:
+            all_deals.extend(collect_arcalive_recent_deals(days=SEARCH_WINDOW_DAYS))
+        except Exception as e:
+            crawl_errors.append(f"아카라이브: {e}")
 
-    if not matched:
-        msg = f"🔎 최근 {SEARCH_WINDOW_DAYS}일 기준 **{keyword}** 검색 결과가 없습니다."
+        matched = []
+        seen_links = set()
+        for deal in all_deals:
+            title = (deal.get("title") or "").strip()
+            link = (deal.get("link") or "").strip()
+            if not title or not link:
+                continue
+            if link in seen_links:
+                continue
+            if not _is_query_match(title, keyword):
+                continue
+            seen_links.add(link)
+            matched.append({
+                "title": title,
+                "link": link,
+                "price": deal.get("price"),
+                "platform": _platform_name(link),
+                "posted_at": deal.get("posted_at"),
+            })
+
+        matched.sort(
+            key=lambda x: x["posted_at"] if x.get("posted_at") else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc),
+            reverse=True
+        )
+
+        if not matched:
+            msg = f"🔎 최근 {SEARCH_WINDOW_DAYS}일 기준 **{keyword}** 검색 결과가 없습니다."
+            msg += f"\n(스캔 게시글: {len(all_deals)}건)"
+            if crawl_errors:
+                msg += "\n⚠️ 일부 사이트 수집 실패: " + " | ".join(crawl_errors)
+            await interaction.followup.send(msg)
+            return
+
+        shown = min(len(matched), limit)
+        embeds = []
+        for deal in matched[:shown]:
+            price_text = f"{deal['price']:,}원" if deal["price"] else "가격 미상"
+            embed = discord.Embed(
+                title=deal["title"][:256],
+                url=deal["link"],
+                color=0x00AAFF
+            )
+            embed.add_field(name="플랫폼", value=deal["platform"], inline=True)
+            embed.add_field(name="가격", value=price_text, inline=True)
+            embed.add_field(name="작성시각", value=_format_posted_at(deal.get("posted_at")), inline=True)
+            embed.add_field(name="페이지", value=deal["link"], inline=False)
+            embeds.append(embed)
+
+        msg = f"🔎 최근 {SEARCH_WINDOW_DAYS}일 기준 **{keyword}** 검색 결과 {len(matched)}건 중 {shown}건을 보여드립니다."
         msg += f"\n(스캔 게시글: {len(all_deals)}건)"
         if crawl_errors:
             msg += "\n⚠️ 일부 사이트 수집 실패: " + " | ".join(crawl_errors)
-        await interaction.followup.send(msg)
-        return
-
-    shown = min(len(matched), limit)
-    embeds = []
-    for deal in matched[:shown]:
-        price_text = f"{deal['price']:,}원" if deal["price"] else "가격 미상"
-        embed = discord.Embed(
-            title=deal["title"][:256],
-            url=deal["link"],
-            color=0x00AAFF
-        )
-        embed.add_field(name="플랫폼", value=deal["platform"], inline=True)
-        embed.add_field(name="가격", value=price_text, inline=True)
-        embed.add_field(name="작성시각", value=_format_posted_at(deal.get("posted_at")), inline=True)
-        embed.add_field(name="페이지", value=deal["link"], inline=False)
-        embeds.append(embed)
-
-    msg = f"🔎 최근 {SEARCH_WINDOW_DAYS}일 기준 **{keyword}** 검색 결과 {len(matched)}건 중 {shown}건을 보여드립니다."
-    msg += f"\n(스캔 게시글: {len(all_deals)}건)"
-    if crawl_errors:
-        msg += "\n⚠️ 일부 사이트 수집 실패: " + " | ".join(crawl_errors)
-
-    await interaction.followup.send(msg, embeds=embeds)
+        await interaction.followup.send(msg, embeds=embeds)
 
 # =======================================================
 
