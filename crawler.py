@@ -20,6 +20,47 @@ UTC = datetime.timezone.utc
 KST = ZoneInfo("Asia/Seoul")
 FMKOREA_PLAYWRIGHT_SEMAPHORE = asyncio.Semaphore(1)
 
+
+def _fmkorea_is_blocked(status_code, soup):
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    return status_code != 200 or "보안 시스템" in title
+
+
+def _parse_fmkorea_listing_items(soup, now_kst=None, cutoff_utc=None):
+    items = []
+    seen = set()
+    page_has_recent_post = False
+    anchors = soup.select("a.hotdeal_var8")
+
+    for anchor in anchors:
+        title = _normalize_title(anchor.get_text(" ", strip=True))
+        link = normalize_link(FMKOREA_URL, anchor.get("href"))
+        if not title or not link or link in seen:
+            continue
+        seen.add(link)
+
+        payload = {
+            "title": title,
+            "link": link,
+            "price": extract_price(title),
+        }
+
+        if cutoff_utc is not None:
+            container = anchor.find_parent("li") or anchor.find_parent("tr")
+            date_text = extract_fmkorea_row_date_text(container)
+            posted_at = parse_fmkorea_datetime(date_text, now_kst)
+            if posted_at is None:
+                continue
+            if posted_at >= cutoff_utc:
+                page_has_recent_post = True
+            else:
+                continue
+            payload["posted_at"] = _to_aware_utc(posted_at)
+
+        items.append(payload)
+
+    return items, page_has_recent_post, len(anchors)
+
 def normalize_link(base_url, href):
     if not href:
         return None
@@ -296,7 +337,36 @@ def collect_arcalive_recent_deals(days=30, max_pages=400):
 
     return items
 
-async def collect_fmkorea_recent_deals(days=30, max_pages=400):
+def _collect_fmkorea_recent_deals_http(days=30, max_pages=400):
+    now_kst = datetime.datetime.now(KST)
+    cutoff_utc = _recent_cutoff_utc(days=days)
+    items = []
+
+    with requests.Session() as session:
+        for page_num in range(1, max_pages + 1):
+            target_url = f"{FMKOREA_URL}?page={page_num}"
+            res = session.get(target_url, headers=HEADERS, timeout=20)
+            soup = BeautifulSoup(res.text, "html.parser")
+
+            if _fmkorea_is_blocked(res.status_code, soup):
+                return items, True, False
+
+            page_items, page_has_recent_post, anchor_count = _parse_fmkorea_listing_items(
+                soup, now_kst=now_kst, cutoff_utc=cutoff_utc
+            )
+            if page_num == 1 and anchor_count == 0:
+                return items, False, True
+            if anchor_count == 0:
+                break
+
+            items.extend(page_items)
+            if not page_has_recent_post:
+                break
+
+    return items, False, False
+
+
+async def _collect_fmkorea_recent_deals_playwright(days=30, max_pages=400):
     now_kst = datetime.datetime.now(KST)
     cutoff_utc = _recent_cutoff_utc(days=days)
     items = []
@@ -317,47 +387,19 @@ async def collect_fmkorea_recent_deals(days=30, max_pages=400):
                     await page.goto(target_url, timeout=25000)
                     await page.wait_for_timeout(1500)
 
-                    page_title = await page.title()
-                    if "보안 시스템" in page_title:
+                    html = await page.content()
+                    soup = BeautifulSoup(html, "html.parser")
+                    if _fmkorea_is_blocked(200, soup):
                         blocked = True
                         break
 
-                    html = await page.content()
-                    soup = BeautifulSoup(html, "html.parser")
-                    anchors = soup.select("a.hotdeal_var8, td.title > a, a.title")
-                    if not anchors:
+                    page_items, page_has_recent_post, anchor_count = _parse_fmkorea_listing_items(
+                        soup, now_kst=now_kst, cutoff_utc=cutoff_utc
+                    )
+                    if anchor_count == 0:
                         break
 
-                    page_has_recent_post = False
-                    page_seen_urls = set()
-
-                    for anchor in anchors:
-                        title = _normalize_title(anchor.get_text(" ", strip=True))
-                        link = normalize_link(FMKOREA_URL, anchor.get("href"))
-                        if not title or not link or link in page_seen_urls:
-                            continue
-                        page_seen_urls.add(link)
-
-                        row = anchor.find_parent("tr")
-                        date_text = extract_fmkorea_row_date_text(row)
-                        posted_at = parse_fmkorea_datetime(date_text, now_kst)
-                        if posted_at is None:
-                            continue
-
-                        if posted_at >= cutoff_utc:
-                            page_has_recent_post = True
-                        else:
-                            continue
-
-                        items.append(
-                            {
-                                "title": title,
-                                "link": link,
-                                "price": extract_price(title),
-                                "posted_at": _to_aware_utc(posted_at),
-                            }
-                        )
-
+                    items.extend(page_items)
                     if not page_has_recent_post:
                         break
             finally:
@@ -365,60 +407,82 @@ async def collect_fmkorea_recent_deals(days=30, max_pages=400):
 
     return items, blocked
 
-async def parse_fmkorea():
+
+async def collect_fmkorea_recent_deals(days=30, max_pages=400):
+    try:
+        items, blocked, structure_failed = _collect_fmkorea_recent_deals_http(days=days, max_pages=max_pages)
+        if not blocked and not structure_failed:
+            print("펨코 최근 검색 수집: HTTP fetch 성공")
+            return items, False
+        if blocked:
+            print("펨코 최근 검색 수집: HTTP fetch 차단, Playwright fallback 시도")
+        else:
+            print("펨코 최근 검색 수집: HTTP 파싱 실패, Playwright fallback 시도")
+    except requests.RequestException as e:
+        print(f"펨코 최근 검색 수집: HTTP fetch 실패 ({e}), Playwright fallback 시도")
+
+    return await _collect_fmkorea_recent_deals_playwright(days=days, max_pages=max_pages)
+
+def _parse_fmkorea_http_latest():
+    with requests.Session() as session:
+        res = session.get(FMKOREA_URL, headers=HEADERS, timeout=20)
+        soup = BeautifulSoup(res.text, "html.parser")
+        if _fmkorea_is_blocked(res.status_code, soup):
+            return [], True, False
+
+        items, _page_has_recent_post, anchor_count = _parse_fmkorea_listing_items(soup)
+        if anchor_count == 0:
+            return [], False, True
+        return items, False, False
+
+
+async def _parse_fmkorea_playwright_latest():
     items = []
-    # Playwright를 이용해 동적으로 페이지 접근
     async with FMKOREA_PLAYWRIGHT_SEMAPHORE:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
-            
+
             try:
                 cookie_header = os.getenv("FMKOREA_COOKIE")
                 if cookie_header:
                     await page.set_extra_http_headers({"Cookie": cookie_header})
 
-                # 펨코 핫딜 게시판으로 이동
                 await page.goto(FMKOREA_URL, timeout=20000)
                 await page.wait_for_timeout(2000)
 
-                page_title = await page.title()
-                if "보안 시스템" in page_title:
-                    print("펨코 크롤링 차단됨: 보안 시스템 페이지가 표시되어 게시글을 수집할 수 없습니다. 필요하면 FMKOREA_COOKIE 환경 변수를 설정해 주세요.")
-                    return []
-                
-                # 게시물 리스트 추출
-                # 펨코 프론트 구조가 바뀔 수 있어 선택자를 순차적으로 시도합니다.
-                selectors = ["a.hotdeal_var8", ".hotdeal_var8", "a.title"]
-                elements = []
-                for selector in selectors:
-                    elements = await page.query_selector_all(selector)
-                    if elements:
-                        break
-                
-                seen = set()
-                for elem in elements:
-                    title = await elem.inner_text()
-                    href = await elem.get_attribute("href")
-                    
-                    link = normalize_link(FMKOREA_URL, href)
-                    if not link or link in seen:
-                        continue
-                    seen.add(link)
-                        
-                    price = extract_price(title)
-                    
-                    if title and link:
-                        items.append({
-                            "title": title.strip(),
-                            "link": link,
-                            "price": price
-                        })
+                html = await page.content()
+                soup = BeautifulSoup(html, "html.parser")
+                if _fmkorea_is_blocked(200, soup):
+                    print("펨코 크롤링 차단됨: 보안 시스템 페이지가 표시되어 게시글을 수집할 수 없습니다.")
+                    return [], True
+
+                items, _page_has_recent_post, _anchor_count = _parse_fmkorea_listing_items(soup)
             except Exception as e:
                 print(f"펨코 크롤링 실패: {e}")
+                return [], False
             finally:
                 await browser.close()
-            
+
+    return items, False
+
+
+async def parse_fmkorea():
+    try:
+        items, blocked, structure_failed = _parse_fmkorea_http_latest()
+        if not blocked and not structure_failed:
+            print("펨코 최신 수집: HTTP fetch 성공")
+            return items
+        if blocked:
+            print("펨코 최신 수집: HTTP fetch 차단, Playwright fallback 시도")
+        else:
+            print("펨코 최신 수집: HTTP 파싱 실패, Playwright fallback 시도")
+    except requests.RequestException as e:
+        print(f"펨코 최신 수집: HTTP fetch 실패 ({e}), Playwright fallback 시도")
+
+    items, blocked = await _parse_fmkorea_playwright_latest()
+    if blocked:
+        print("펨코 최신 수집: Playwright도 차단됨")
     return items
 
 def parse_arcalive():
