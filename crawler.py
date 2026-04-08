@@ -1,6 +1,7 @@
 import os
 import asyncio
 import datetime
+import time
 import requests
 from bs4 import BeautifulSoup
 import re
@@ -11,7 +12,6 @@ from zoneinfo import ZoneInfo
 
 URL = "https://bbs.ruliweb.com/market/board/1020"
 FMKOREA_URL = "https://www.fmkorea.com/hotdeal"
-ARCALIVE_URL = "https://arca.live/b/hotdeal?format=rss"
 ARCALIVE_BOARD_URL = "https://arca.live/b/hotdeal"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -19,11 +19,196 @@ HEADERS = {
 UTC = datetime.timezone.utc
 KST = ZoneInfo("Asia/Seoul")
 FMKOREA_PLAYWRIGHT_SEMAPHORE = asyncio.Semaphore(1)
+RULIWEB_BOARD_TITLE = "핫딜예판 유저 핫딜 중고장터"
+ARCALIVE_BOARD_TITLE = "핫딜 채널"
+RULIWEB_ROW_SELECTOR = "tr.table_body"
+RULIWEB_TITLE_SELECTOR = "td.subject a.deco"
+ARCALIVE_ROW_SELECTOR = ".vrow.hybrid, a.vrow.column:not(.notice)"
+ARCALIVE_TITLE_SELECTOR = "a.title.hybrid-title, a.title"
 
 
 def _fmkorea_is_blocked(status_code, soup):
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
     return status_code != 200 or "보안 시스템" in title
+
+
+def _ruliweb_response_ok(status_code, soup):
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    return (
+        status_code == 200
+        and RULIWEB_BOARD_TITLE in title
+        and bool(soup.select(RULIWEB_ROW_SELECTOR))
+        and bool(soup.select(RULIWEB_TITLE_SELECTOR))
+    )
+
+
+def _arcalive_is_blocked(status_code, soup, html_text):
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    return (
+        status_code != 200
+        or "Just a moment..." in title
+        or "Enable JavaScript and cookies to continue" in html_text
+    )
+
+
+def _arcalive_response_ok(status_code, soup, html_text):
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    return (
+        not _arcalive_is_blocked(status_code, soup, html_text)
+        and ARCALIVE_BOARD_TITLE in title
+        and bool(soup.select(ARCALIVE_ROW_SELECTOR))
+        and bool(soup.select(ARCALIVE_TITLE_SELECTOR))
+    )
+
+
+def _parse_ruliweb_listing_items(soup, now_kst=None, cutoff_utc=None, exclude_best=False):
+    items = []
+    seen = set()
+    page_has_recent_post = False
+
+    for row in soup.select(RULIWEB_ROW_SELECTOR):
+        row_classes = row.get("class", [])
+        if "notice" in row_classes or (exclude_best and "best" in row_classes):
+            continue
+
+        title_tag = row.select_one(RULIWEB_TITLE_SELECTOR)
+        if not title_tag:
+            continue
+
+        title = _normalize_title(title_tag.get_text(" ", strip=True))
+        link = normalize_link(URL, title_tag.get("href"))
+        if not title or not link or link in seen:
+            continue
+
+        payload = {
+            "title": title,
+            "link": link,
+            "price": extract_price(title),
+        }
+
+        if cutoff_utc is not None:
+            date_tag = row.select_one("td.time")
+            if not date_tag:
+                continue
+
+            posted_at = parse_ruliweb_datetime(date_tag.get_text(" ", strip=True), now_kst)
+            if posted_at is None:
+                continue
+
+            if posted_at >= cutoff_utc:
+                page_has_recent_post = True
+            else:
+                continue
+
+            payload["posted_at"] = _to_aware_utc(posted_at)
+
+        seen.add(link)
+        items.append(payload)
+
+    return items, page_has_recent_post
+
+
+def _parse_arcalive_listing_items(soup, cutoff_utc=None):
+    items = []
+    seen = set()
+    page_has_recent_post = False
+
+    for row in soup.select(ARCALIVE_ROW_SELECTOR):
+        title_tag = row.select_one(ARCALIVE_TITLE_SELECTOR)
+        if not title_tag:
+            continue
+
+        title = _normalize_title(title_tag.get_text(" ", strip=True))
+        link = normalize_link("https://arca.live", title_tag.get("href") or row.get("href"))
+        if not title or not link or link in seen:
+            continue
+
+        payload = {
+            "title": title,
+            "link": link,
+        }
+
+        price = None
+        price_tag = row.select_one(".deal-price")
+        if price_tag:
+            price = extract_price(price_tag.get_text(" ", strip=True))
+        if price is None:
+            price = extract_price(title)
+        payload["price"] = price
+
+        if cutoff_utc is not None:
+            time_tag = row.select_one("time[datetime]")
+            if not time_tag:
+                continue
+
+            iso_dt = time_tag.get("datetime")
+            if not iso_dt:
+                continue
+
+            try:
+                posted_at = datetime.datetime.fromisoformat(iso_dt.replace("Z", "+00:00")).astimezone(UTC)
+            except ValueError:
+                continue
+
+            if posted_at >= cutoff_utc:
+                page_has_recent_post = True
+            else:
+                continue
+
+            payload["posted_at"] = _to_aware_utc(posted_at)
+
+        seen.add(link)
+        items.append(payload)
+
+    return items, page_has_recent_post
+
+
+def _parse_ruliweb_latest_with_client(client):
+    res = client.get(URL, headers=HEADERS, timeout=20)
+    res.raise_for_status()
+    soup = BeautifulSoup(res.text, "html.parser")
+    if not _ruliweb_response_ok(res.status_code, soup):
+        raise ValueError("루리웹 응답 구조 확인 실패")
+    items, _page_has_recent_post = _parse_ruliweb_listing_items(soup)
+    return items
+
+
+def _collect_ruliweb_recent_deals_with_client(client, days=30, max_pages=400):
+    now_kst = datetime.datetime.now(KST)
+    cutoff_utc = _recent_cutoff_utc(days=days)
+    items = []
+    pages_scanned = 0
+
+    for page in range(1, max_pages + 1):
+        target_url = f"{URL}?page={page}"
+        res = client.get(target_url, headers=HEADERS, timeout=20)
+        res.raise_for_status()
+        soup = BeautifulSoup(res.text, "html.parser")
+        if page == 1 and not _ruliweb_response_ok(res.status_code, soup):
+            raise ValueError("루리웹 응답 구조 확인 실패")
+
+        rows = soup.select(RULIWEB_ROW_SELECTOR)
+        if not rows:
+            break
+        pages_scanned += 1
+
+        page_items, page_has_recent_post = _parse_ruliweb_listing_items(
+            soup, now_kst=now_kst, cutoff_utc=cutoff_utc, exclude_best=True
+        )
+        items.extend(page_items)
+        if not page_has_recent_post:
+            break
+
+    return items, pages_scanned
+
+
+def _parse_arcalive_latest_with_client(client):
+    res = client.get(ARCALIVE_BOARD_URL, headers=HEADERS, timeout=20)
+    soup = BeautifulSoup(res.text, "html.parser")
+    if not _arcalive_response_ok(res.status_code, soup, res.text):
+        raise ValueError("아카라이브 응답 구조 확인 실패")
+    items, _page_has_recent_post = _parse_arcalive_listing_items(soup)
+    return items
 
 
 def _parse_fmkorea_listing_items(soup, now_kst=None, cutoff_utc=None):
@@ -70,43 +255,22 @@ def normalize_link(base_url, href):
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 def parse_ruliweb():
-    res = requests.get(URL, headers=HEADERS, timeout=20)
-    res.raise_for_status()
-    soup = BeautifulSoup(res.text, 'html.parser')
-    
-    items = []
-    
-    # 루리웹 게시판 리스트 구조 분석용
-    rows = soup.select("tr.table_body")
-    for row in rows:
-        # 공지사항(notice)인지 확인
-        if "notice" in row.get("class", []):
-            continue
-            
-        # 제목 태그 추출 (현재 루리웹 구조는 td.subject > a.deco 로 되어 있음)
-        subject_td = row.select_one("td.subject")
-        if not subject_td:
-            continue
-            
-        title_tag = subject_td.select_one("a.deco")
-        if not title_tag:
-            continue
-            
-        title = title_tag.text.strip()
-        link = normalize_link(URL, title_tag.get("href"))
-        if not link:
-            continue
-        
-        # 제목 앞부분의 말머리를 떼기 위해 한 번 더 정제할 수 있지만 일단 원본 유지
-        price = extract_price(title)
-        
-        items.append({
-            "title": title,
-            "link": link,
-            "price": price
-        })
-        
-    return items
+    try:
+        with requests.Session() as session:
+            items = _parse_ruliweb_latest_with_client(session)
+        print("루리웹 최신 수집: requests fetch 성공")
+        return items
+    except (requests.RequestException, ValueError) as e:
+        print(f"루리웹 최신 수집: requests fetch 실패 ({e}), cloudscraper fallback 시도")
+
+    try:
+        with cloudscraper.create_scraper() as scraper:
+            items = _parse_ruliweb_latest_with_client(scraper)
+        print("루리웹 최신 수집: cloudscraper fallback 성공")
+        return items
+    except Exception as e:
+        print(f"루리웹 최신 수집: cloudscraper fallback 실패 ({e})")
+        return []
 
 def extract_price(title):
     # 정규표현식: 3자리마다 콤마가 있거나 없는 숫자 + '원' 이 붙어있는 형태를 주로 찾습니다.
@@ -136,6 +300,13 @@ def _to_aware_utc(dt_obj):
     if dt_obj.tzinfo is None:
         return dt_obj.replace(tzinfo=UTC)
     return dt_obj.astimezone(UTC)
+
+
+def _format_recent_search_stats(items_count, pages_scanned, elapsed_seconds, blocked_status="아님", fallback_status="미사용"):
+    return (
+        f"{items_count}건, {pages_scanned}페이지, {elapsed_seconds:.2f}초, "
+        f"차단={blocked_status}, fallback={fallback_status}"
+    )
 
 def parse_ruliweb_datetime(raw_text, now_kst):
     text = (raw_text or "").strip()
@@ -223,139 +394,88 @@ def extract_fmkorea_row_date_text(row):
     return None
 
 def collect_ruliweb_recent_deals(days=30, max_pages=400):
-    now_kst = datetime.datetime.now(KST)
-    cutoff_utc = _recent_cutoff_utc(days=days)
-    items = []
+    started_at = time.perf_counter()
+    try:
+        with requests.Session() as session:
+            items, pages_scanned = _collect_ruliweb_recent_deals_with_client(session, days=days, max_pages=max_pages)
+        elapsed = time.perf_counter() - started_at
+        print(
+            f"루리웹 최근 검색 수집: requests fetch 성공 "
+            f"({_format_recent_search_stats(len(items), pages_scanned, elapsed, blocked_status='아님', fallback_status='미사용')})"
+        )
+        return items
+    except (requests.RequestException, ValueError) as e:
+        print(f"루리웹 최근 검색 수집: requests fetch 실패 ({e}), cloudscraper fallback 시도")
 
-    with requests.Session() as session:
-        for page in range(1, max_pages + 1):
-            target_url = f"{URL}?page={page}"
-            res = session.get(target_url, headers=HEADERS, timeout=20)
-            res.raise_for_status()
-            soup = BeautifulSoup(res.text, "html.parser")
-            rows = soup.select("tr.table_body")
-            if not rows:
-                break
-
-            page_has_recent_post = False
-            for row in rows:
-                row_classes = row.get("class", [])
-                if "notice" in row_classes or "best" in row_classes:
-                    continue
-
-                title_tag = row.select_one("td.subject a.deco")
-                date_tag = row.select_one("td.time")
-                if not title_tag or not date_tag:
-                    continue
-
-                posted_at = parse_ruliweb_datetime(date_tag.get_text(" ", strip=True), now_kst)
-                if posted_at is None:
-                    continue
-
-                if posted_at >= cutoff_utc:
-                    page_has_recent_post = True
-                else:
-                    continue
-
-                title = _normalize_title(title_tag.get_text(" ", strip=True))
-                link = normalize_link(URL, title_tag.get("href"))
-                if not title or not link:
-                    continue
-
-                items.append(
-                    {
-                        "title": title,
-                        "link": link,
-                        "price": extract_price(title),
-                        "posted_at": _to_aware_utc(posted_at),
-                    }
-                )
-
-            if not page_has_recent_post:
-                break
-
-    return items
+    started_at = time.perf_counter()
+    try:
+        with cloudscraper.create_scraper() as scraper:
+            items, pages_scanned = _collect_ruliweb_recent_deals_with_client(scraper, days=days, max_pages=max_pages)
+        elapsed = time.perf_counter() - started_at
+        print(
+            f"루리웹 최근 검색 수집: cloudscraper fallback 성공 "
+            f"({_format_recent_search_stats(len(items), pages_scanned, elapsed, blocked_status='아님', fallback_status='cloudscraper')})"
+        )
+        return items
+    except Exception as e:
+        print(f"루리웹 최근 검색 수집: cloudscraper fallback 실패 ({e})")
+        return []
 
 def collect_arcalive_recent_deals(days=30, max_pages=400):
     cutoff_utc = _recent_cutoff_utc(days=days)
     items = []
+    pages_scanned = 0
+    started_at = time.perf_counter()
 
-    with cloudscraper.create_scraper() as scraper:
-        for page in range(1, max_pages + 1):
-            target_url = f"{ARCALIVE_BOARD_URL}?p={page}"
-            res = scraper.get(target_url, headers=HEADERS, timeout=20)
-            res.raise_for_status()
-            soup = BeautifulSoup(res.text, "html.parser")
-            rows = soup.select(".vrow.hybrid, a.vrow.column:not(.notice)")
-            if not rows:
-                break
+    try:
+        with cloudscraper.create_scraper() as scraper:
+            for page in range(1, max_pages + 1):
+                target_url = f"{ARCALIVE_BOARD_URL}?p={page}"
+                res = scraper.get(target_url, headers=HEADERS, timeout=20)
+                res.raise_for_status()
+                soup = BeautifulSoup(res.text, "html.parser")
+                rows = soup.select(ARCALIVE_ROW_SELECTOR)
+                if not rows:
+                    break
+                pages_scanned += 1
 
-            page_has_recent_post = False
-            for row in rows:
-                title_tag = row.select_one("a.title.hybrid-title, a.title")
-                time_tag = row.select_one("time[datetime]")
-                if not title_tag or not time_tag:
-                    continue
+                page_items, page_has_recent_post = _parse_arcalive_listing_items(soup, cutoff_utc=cutoff_utc)
+                items.extend(page_items)
 
-                iso_dt = time_tag.get("datetime")
-                if not iso_dt:
-                    continue
+                if not page_has_recent_post:
+                    break
 
-                try:
-                    posted_at = datetime.datetime.fromisoformat(iso_dt.replace("Z", "+00:00")).astimezone(UTC)
-                except ValueError:
-                    continue
-
-                if posted_at >= cutoff_utc:
-                    page_has_recent_post = True
-                else:
-                    continue
-
-                title = _normalize_title(title_tag.get_text(" ", strip=True))
-                link = normalize_link("https://arca.live", title_tag.get("href") or row.get("href"))
-                if not title or not link:
-                    continue
-
-                price = None
-                price_tag = row.select_one(".deal-price")
-                if price_tag:
-                    price = extract_price(price_tag.get_text(" ", strip=True))
-                if price is None:
-                    price = extract_price(title)
-
-                items.append(
-                    {
-                        "title": title,
-                        "link": link,
-                        "price": price,
-                        "posted_at": _to_aware_utc(posted_at),
-                    }
-                )
-
-            if not page_has_recent_post:
-                break
-
-    return items
+        elapsed = time.perf_counter() - started_at
+        print(
+            f"아카라이브 최근 검색 수집: cloudscraper fetch 성공 "
+            f"({_format_recent_search_stats(len(items), pages_scanned, elapsed, blocked_status='아님', fallback_status='미사용')})"
+        )
+        return items
+    except Exception as e:
+        print(f"아카라이브 최근 검색 수집: cloudscraper fetch 실패 ({e})")
+        return []
 
 def _collect_fmkorea_recent_deals_http(days=30, max_pages=400):
     now_kst = datetime.datetime.now(KST)
     cutoff_utc = _recent_cutoff_utc(days=days)
     items = []
+    pages_scanned = 0
 
     with requests.Session() as session:
         for page_num in range(1, max_pages + 1):
             target_url = f"{FMKOREA_URL}?page={page_num}"
             res = session.get(target_url, headers=HEADERS, timeout=20)
             soup = BeautifulSoup(res.text, "html.parser")
+            pages_scanned += 1
 
             if _fmkorea_is_blocked(res.status_code, soup):
-                return items, True, False
+                return items, True, False, pages_scanned
 
             page_items, page_has_recent_post, anchor_count = _parse_fmkorea_listing_items(
                 soup, now_kst=now_kst, cutoff_utc=cutoff_utc
             )
             if page_num == 1 and anchor_count == 0:
-                return items, False, True
+                return items, False, True, pages_scanned
             if anchor_count == 0:
                 break
 
@@ -363,7 +483,7 @@ def _collect_fmkorea_recent_deals_http(days=30, max_pages=400):
             if not page_has_recent_post:
                 break
 
-    return items, False, False
+    return items, False, False, pages_scanned
 
 
 async def _collect_fmkorea_recent_deals_playwright(days=30, max_pages=400):
@@ -371,6 +491,7 @@ async def _collect_fmkorea_recent_deals_playwright(days=30, max_pages=400):
     cutoff_utc = _recent_cutoff_utc(days=days)
     items = []
     blocked = False
+    pages_scanned = 0
 
     async with FMKOREA_PLAYWRIGHT_SEMAPHORE:
         async with async_playwright() as p:
@@ -386,6 +507,7 @@ async def _collect_fmkorea_recent_deals_playwright(days=30, max_pages=400):
                     target_url = f"{FMKOREA_URL}?page={page_num}"
                     await page.goto(target_url, timeout=25000)
                     await page.wait_for_timeout(1500)
+                    pages_scanned += 1
 
                     html = await page.content()
                     soup = BeautifulSoup(html, "html.parser")
@@ -405,23 +527,49 @@ async def _collect_fmkorea_recent_deals_playwright(days=30, max_pages=400):
             finally:
                 await browser.close()
 
-    return items, blocked
+    return items, blocked, pages_scanned
 
 
 async def collect_fmkorea_recent_deals(days=30, max_pages=400):
+    started_at = time.perf_counter()
     try:
-        items, blocked, structure_failed = _collect_fmkorea_recent_deals_http(days=days, max_pages=max_pages)
+        items, blocked, structure_failed, pages_scanned = _collect_fmkorea_recent_deals_http(days=days, max_pages=max_pages)
         if not blocked and not structure_failed:
-            print("펨코 최근 검색 수집: HTTP fetch 성공")
+            elapsed = time.perf_counter() - started_at
+            print(
+                f"펨코 최근 검색 수집: HTTP fetch 성공 "
+                f"({_format_recent_search_stats(len(items), pages_scanned, elapsed, blocked_status='아님', fallback_status='미사용')})"
+            )
             return items, False
         if blocked:
-            print("펨코 최근 검색 수집: HTTP fetch 차단, Playwright fallback 시도")
+            elapsed = time.perf_counter() - started_at
+            print(
+                f"펨코 최근 검색 수집: HTTP fetch 차단, Playwright fallback 시도 "
+                f"({_format_recent_search_stats(len(items), pages_scanned, elapsed, blocked_status='HTTP', fallback_status='Playwright 예정')})"
+            )
         else:
-            print("펨코 최근 검색 수집: HTTP 파싱 실패, Playwright fallback 시도")
+            elapsed = time.perf_counter() - started_at
+            print(
+                f"펨코 최근 검색 수집: HTTP 파싱 실패, Playwright fallback 시도 "
+                f"({_format_recent_search_stats(len(items), pages_scanned, elapsed, blocked_status='아님', fallback_status='Playwright 예정')})"
+            )
     except requests.RequestException as e:
         print(f"펨코 최근 검색 수집: HTTP fetch 실패 ({e}), Playwright fallback 시도")
 
-    return await _collect_fmkorea_recent_deals_playwright(days=days, max_pages=max_pages)
+    started_at = time.perf_counter()
+    items, blocked, pages_scanned = await _collect_fmkorea_recent_deals_playwright(days=days, max_pages=max_pages)
+    elapsed = time.perf_counter() - started_at
+    if blocked:
+        print(
+            f"펨코 최근 검색 수집: Playwright도 차단됨 "
+            f"({_format_recent_search_stats(len(items), pages_scanned, elapsed, blocked_status='HTTP+Playwright', fallback_status='Playwright')})"
+        )
+    else:
+        print(
+            f"펨코 최근 검색 수집: Playwright fallback 성공 "
+            f"({_format_recent_search_stats(len(items), pages_scanned, elapsed, blocked_status='HTTP 차단/실패 후 복구', fallback_status='Playwright')})"
+        )
+    return items, blocked
 
 def _parse_fmkorea_http_latest():
     with requests.Session() as session:
@@ -486,43 +634,14 @@ async def parse_fmkorea():
     return items
 
 def parse_arcalive():
-    items = []
-    with cloudscraper.create_scraper() as scraper:
-        try:
-            html = scraper.get(ARCALIVE_URL, headers=HEADERS, timeout=20).text
-            soup = BeautifulSoup(html, 'html.parser')
-
-            # 최신 DOM은 ".vrow.hybrid" 구조이므로 제목 링크를 기준으로 수집합니다.
-            for vrow in soup.select('.vrow.hybrid, a.vrow.column:not(.notice)'):
-                title_tag = vrow.select_one('a.title.hybrid-title, a.title')
-                if not title_tag:
-                    continue
-
-                raw_title = title_tag.get_text(" ", strip=True)
-                title = " ".join(raw_title.split())
-                if not title:
-                    continue
-
-                link = normalize_link("https://arca.live", title_tag.get('href') or vrow.get('href'))
-                if not link:
-                    continue
-
-                price = None
-                price_tag = vrow.select_one(".deal-price")
-                if price_tag:
-                    price = extract_price(price_tag.get_text(" ", strip=True))
-                if price is None:
-                    price = extract_price(title)
-                
-                items.append({
-                    "title": title,
-                    "link": link,
-                    "price": price
-                })
-        except Exception as e:
-            print(f"아카라이브 크롤링 실패: {e}")
-        
-    return items
+    try:
+        with cloudscraper.create_scraper() as scraper:
+            items = _parse_arcalive_latest_with_client(scraper)
+        print("아카라이브 최신 수집: cloudscraper fetch 성공")
+        return items
+    except Exception as e:
+        print(f"아카라이브 최신 수집: cloudscraper fetch 실패 ({e})")
+        return []
 
 if __name__ == "__main__":
     print("루리웹 핫딜 크롤링 테스트 시작...")
