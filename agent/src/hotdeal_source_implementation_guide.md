@@ -160,14 +160,22 @@
 ## 4. 뽐뿌
 
 ### 1. 사이트 이름
+- 뽐뿌 게시판군
 - 뽐뿌게시판
+- 해외뽐뿌
+- 알리뽐뿌
+- 쇼핑뽐뿌
 
 ### 2. 사이트 url
 - `https://www.ppomppu.co.kr/zboard/zboard.php?id=ppomppu`
+- `https://www.ppomppu.co.kr/zboard/zboard.php?id=ppomppu4`
+- `https://www.ppomppu.co.kr/zboard/zboard.php?id=ppomppu8`
+- `https://www.ppomppu.co.kr/zboard/zboard.php?id=pmarket`
 
 ### 3. 해당 사이트에서 핫딜정보를 가져오는 방법 요약
 - `requests`로 정적 HTML을 바로 받을 수 있습니다.
 - 구형 게시판 구조지만 파싱은 비교적 단순합니다.
+- 현재 구현은 4개 보드를 각각 수집한 뒤, canonical URL 기준으로 합칩니다.
 
 ### 4. 사이트 접근 방법 (1차)
 - `requests.Session().get(url, headers=HEADERS, timeout=20)` `실측`
@@ -175,9 +183,8 @@
 ### 4-(1). 정보획득 성공/실패 확인은 무엇을 통해 확인할 수 있는지
 - 성공 확인:
   - HTTP 상태코드 `200`
-  - 페이지 제목 `뽐뿌 - 뽐뿌게시판`
-  - `tr.baseList` 개수 `> 0`
-  - `a.baseList-title[href*="view.php?id=ppomppu"]` 개수 `> 0`
+  - 페이지 제목에 해당 보드명 포함
+  - `a.baseList-title[href*="view.php?id=<board_id>"]` 개수 `> 0`
 - 실패 확인:
   - 비정상 상태코드
   - 목록 row 또는 제목 링크가 `0`
@@ -188,22 +195,24 @@
 
 ### 6. 정보 획득 시 이를 parsing하는 방법
 - row:
-  - `tr.baseList`
+  - `tr` 전체를 순회하되, 첫 번째 `td`가 숫자인 행만 사용
+  - 이 조건으로 공지/구분 row와 쇼핑뽐뿌의 중복 보조 row를 함께 제외
 - 제목/링크:
-  - `a.baseList-title`
+  - `a.baseList-title[href*="view.php?id=<board_id>"]`
 - 날짜:
-  - row 내부 `td` 중 4번째 `td.baseList-space` 텍스트
-  - 예: `26/04/07`
-- 작성자:
-  - row 내부 3번째 `td.baseList-space`
+  - row 내부 `td` 중 정규식으로 탐지
+  - 오늘 글: `HH:MM:SS`
+  - 이전 날짜 글: `YY/MM/DD`
 - 글 링크 패턴:
-  - `view.php?id=ppomppu&page=...&divpage=...&no=...`
+  - `view.php?id=<board_id>&page=...&divpage=...&no=...`
+  - canonical URL은 `id`와 `no`만 유지
 - 페이지네이션:
-  - `https://www.ppomppu.co.kr/zboard/zboard.php?id=ppomppu&page=N`
+  - `https://www.ppomppu.co.kr/zboard/zboard.php?id=<board_id>&page=N`
 
 ### 7. 기타 사항
-- row 내부 클래스가 세부 필드별로 충분히 구분되지 않아, 일부 필드는 `td` 위치 기반 파싱이 더 현실적입니다.
-- 공지/규칙 글이 섞일 수 있으므로 제목 링크와 번호 셀을 같이 확인하는 편이 안전합니다.
+- `normalize_link()`를 그대로 쓰면 모든 글이 `/zboard/view.php`로 붕괴하므로, 뽐뿌 전용 canonical URL 함수가 필수입니다.
+- `쇼핑뽐뿌`는 `tr.baseList`가 아니라 일반 `tr` 기반으로 잡히므로, 보드 공통 파서를 row 번호 셀 기준으로 설계해야 합니다.
+- `해외뽐뿌`와 `알리뽐뿌` 사이에는 일부 교차 노출이 있어 최종 결과 dedupe가 필요합니다.
 
 ## 5. 딜바다
 
