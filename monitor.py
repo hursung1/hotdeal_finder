@@ -1,7 +1,8 @@
 import discord
+from urllib.parse import parse_qs, urlsplit
 from database import SessionLocal
 from models import Keyword, DealHistory
-from crawler import parse_ruliweb, parse_fmkorea, parse_arcalive
+from crawler import parse_ppomppu, parse_ruliweb, parse_fmkorea, parse_arcalive
 
 def _truncate(text, limit=1000):
     if text is None:
@@ -23,6 +24,12 @@ async def run_crawling_cycle(bot, channel_id):
     db = SessionLocal()
     try:
         deals = []
+        try:
+            ppomppu_deals = parse_ppomppu()
+            deals.extend(ppomppu_deals)
+        except Exception as e:
+            print(f"뽐뿌 크롤링 모듈 에러: {e}")
+
         try:
             ruli_deals = parse_ruliweb()
             deals.extend(ruli_deals)
@@ -116,10 +123,24 @@ async def run_crawling_cycle(bot, channel_id):
                     await channel.send(embed=embed)
                     
                     # 7. 디스코드 전송 성공 후에만 DB에 저장하여 "전송 실패 후 영구 스킵"을 방지합니다.
-                    if "fmkorea" in deal['link']:
+                    if deal.get("platform"):
+                        platform_name = deal["platform"]
+                    elif "fmkorea" in deal['link']:
                         platform_name = "펨코"
                     elif "arca.live" in deal['link']:
                         platform_name = "아카라이브"
+                    elif "ppomppu.co.kr" in deal['link']:
+                        board_id = (parse_qs(urlsplit(deal["link"]).query).get("id") or [""])[0]
+                        if board_id == "ppomppu":
+                            platform_name = "뽐뿌게시판"
+                        elif board_id == "ppomppu4":
+                            platform_name = "해외뽐뿌"
+                        elif board_id == "ppomppu8":
+                            platform_name = "알리뽐뿌"
+                        elif board_id == "pmarket":
+                            platform_name = "쇼핑뽐뿌"
+                        else:
+                            platform_name = "뽐뿌"
                     else:
                         platform_name = "루리웹"
                         
