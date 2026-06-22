@@ -10,10 +10,11 @@ from dotenv import load_dotenv
 
 from monitor import run_crawling_cycle
 from crawler import (
+    PPOMPPU_PRODUCT_PARSER_DISPLAY_NAME,
     get_ppomppu_recent_deals_cached,
     ppomppu_recent_cache_needs_refresh,
     refresh_ppomppu_recent_cache_if_needed,
-    extract_ppomppu_product_with_ollama,
+    extract_ppomppu_product_with_openclaw,
     collect_ruliweb_recent_deals,
     collect_fmkorea_recent_deals,
     collect_arcalive_recent_deals,
@@ -36,7 +37,13 @@ KST = datetime.timezone(datetime.timedelta(hours=9))
 SEARCH_WINDOW_DAYS = 15
 SEARCH_SEMAPHORE = asyncio.Semaphore(1)
 PPOMPPU_CACHE_REFRESH_TASK = None
-PPOMPPU_OLLAMA_PARSE_BUDGET = max(1, int(os.getenv("PPOMPPU_OLLAMA_PARSE_BUDGET", "5")))
+PPOMPPU_LLM_PARSE_BUDGET = max(
+    1,
+    int(os.getenv("PPOMPPU_OPENCLAW_PARSE_BUDGET", "5")),
+)
+DISCORD_CONTENT_LIMIT = 2000
+DISCORD_FIELD_VALUE_LIMIT = 1024
+CRAWL_ERROR_DETAIL_LIMIT = 180
 
 # DB 세션 헬퍼 함수
 def get_db_session():
@@ -111,7 +118,46 @@ def _sort_matched_hotdeals(matched, sort_order: str):
     )
 
 
-async def _enrich_ppomppu_matches_with_ollama(matched, keyword, limit):
+def _truncate_text(text, limit: int) -> str:
+    text = "" if text is None else str(text)
+    if len(text) <= limit:
+        return text
+    if limit <= 1:
+        return text[:limit]
+    return text[: limit - 1] + "…"
+
+
+def _format_crawl_error(source: str, error) -> str:
+    detail = str(error).strip()
+    if not detail:
+        detail = error.__class__.__name__
+
+    first_line = next((line.strip() for line in detail.splitlines() if line.strip()), detail)
+    first_line = " ".join(first_line.split())
+    return f"{source}: {_truncate_text(first_line, CRAWL_ERROR_DETAIL_LIMIT)}"
+
+
+def _append_crawl_errors(message: str, crawl_errors) -> str:
+    if not crawl_errors:
+        return _truncate_text(message, DISCORD_CONTENT_LIMIT)
+
+    prefix = "\n⚠️ 일부 사이트 수집 실패: "
+    remaining = DISCORD_CONTENT_LIMIT - len(message) - len(prefix)
+    if remaining <= 0:
+        return _truncate_text(message, DISCORD_CONTENT_LIMIT)
+
+    joined_errors = " | ".join(crawl_errors)
+    if len(joined_errors) <= remaining:
+        return message + prefix + joined_errors
+
+    omitted_note = "… (일부 오류 생략)"
+    if remaining <= len(omitted_note):
+        return message + prefix + _truncate_text(joined_errors, remaining)
+
+    return message + prefix + _truncate_text(joined_errors, remaining - len(omitted_note)) + omitted_note
+
+
+async def _enrich_ppomppu_matches_with_openclaw(matched, keyword, limit):
     ppomppu_candidates = [deal for deal in matched if "ppomppu.co.kr" in deal.get("link", "")]
     if not ppomppu_candidates:
         return 0, 0
@@ -123,14 +169,14 @@ async def _enrich_ppomppu_matches_with_ollama(matched, keyword, limit):
 
     enriched_count = 0
     failed_count = 0
-    parse_budget = min(len(ppomppu_candidates), max(limit, PPOMPPU_OLLAMA_PARSE_BUDGET))
+    parse_budget = min(len(ppomppu_candidates), max(limit, PPOMPPU_LLM_PARSE_BUDGET))
 
     for deal in ppomppu_candidates[:parse_budget]:
         try:
-            parsed = await asyncio.to_thread(extract_ppomppu_product_with_ollama, deal["link"], keyword)
+            parsed = await asyncio.to_thread(extract_ppomppu_product_with_openclaw, deal["link"], keyword)
         except Exception as e:
             failed_count += 1
-            print(f"뽐뿌 gemma4 파싱 실패 ({deal['link']}): {e}")
+            print(f"뽐뿌 {PPOMPPU_PRODUCT_PARSER_DISPLAY_NAME} 파싱 실패 ({deal['link']}): {e}")
             continue
 
         if not parsed:
@@ -313,12 +359,12 @@ async def search_hotdeal(
         try:
             all_deals.extend(get_ppomppu_recent_deals_cached(days=SEARCH_WINDOW_DAYS))
         except Exception as e:
-            crawl_errors.append(f"뽐뿌: {e}")
+            crawl_errors.append(_format_crawl_error("뽐뿌", e))
 
         try:
             all_deals.extend(collect_ruliweb_recent_deals(days=SEARCH_WINDOW_DAYS))
         except Exception as e:
-            crawl_errors.append(f"루리웹: {e}")
+            crawl_errors.append(_format_crawl_error("루리웹", e))
 
         try:
             fmkorea_deals, blocked = await collect_fmkorea_recent_deals(days=SEARCH_WINDOW_DAYS)
@@ -326,12 +372,12 @@ async def search_hotdeal(
             if blocked:
                 crawl_errors.append("펨코: HTTP/브라우저 수집 모두 차단됨")
         except Exception as e:
-            crawl_errors.append(f"펨코: {e}")
+            crawl_errors.append(_format_crawl_error("펨코", e))
 
         try:
             all_deals.extend(collect_arcalive_recent_deals(days=SEARCH_WINDOW_DAYS))
         except Exception as e:
-            crawl_errors.append(f"아카라이브: {e}")
+            crawl_errors.append(_format_crawl_error("아카라이브", e))
 
         matched = []
         seen_links = set()
@@ -353,51 +399,52 @@ async def search_hotdeal(
                 "posted_at": deal.get("posted_at"),
             })
 
-        ppomppu_ollama_enriched = 0
+        ppomppu_openclaw_enriched = 0
         try:
-            ppomppu_ollama_enriched, ppomppu_ollama_failed = await _enrich_ppomppu_matches_with_ollama(
+            ppomppu_openclaw_enriched, ppomppu_openclaw_failed = await _enrich_ppomppu_matches_with_openclaw(
                 matched, keyword, limit
             )
-            if ppomppu_ollama_failed:
-                crawl_errors.append(f"뽐뿌 gemma4 파싱 실패 {ppomppu_ollama_failed}건")
+            if ppomppu_openclaw_failed:
+                crawl_errors.append(f"뽐뿌 {PPOMPPU_PRODUCT_PARSER_DISPLAY_NAME} 파싱 실패 {ppomppu_openclaw_failed}건")
         except Exception as e:
-            crawl_errors.append(f"뽐뿌 gemma4 파싱: {e}")
+            crawl_errors.append(_format_crawl_error(f"뽐뿌 {PPOMPPU_PRODUCT_PARSER_DISPLAY_NAME} 파싱", e))
 
         _sort_matched_hotdeals(matched, sort)
 
         if not matched:
             msg = f"🔎 최근 {SEARCH_WINDOW_DAYS}일 기준 **{keyword}** 검색 결과가 없습니다."
             msg += f"\n(스캔 게시글: {len(all_deals)}건)"
-            if crawl_errors:
-                msg += "\n⚠️ 일부 사이트 수집 실패: " + " | ".join(crawl_errors)
+            msg = _append_crawl_errors(msg, crawl_errors)
             await interaction.followup.send(msg)
             return
 
         shown = min(len(matched), limit)
         embeds = []
         for deal in matched[:shown]:
-            price_text = deal.get("parsed_price_text") or (f"{deal['price']:,}원" if deal["price"] else "가격 미상")
+            price_text = _truncate_text(
+                deal.get("parsed_price_text") or (f"{deal['price']:,}원" if deal["price"] else "가격 미상"),
+                DISCORD_FIELD_VALUE_LIMIT,
+            )
             display_title = deal.get("display_title") or deal["title"]
             embed = discord.Embed(
-                title=display_title[:256],
+                title=_truncate_text(display_title, 256),
                 url=deal.get("product_url") or deal["link"],
                 color=0x00AAFF
             )
-            embed.add_field(name="플랫폼", value=deal["platform"], inline=True)
+            embed.add_field(name="플랫폼", value=_truncate_text(deal["platform"], DISCORD_FIELD_VALUE_LIMIT), inline=True)
             embed.add_field(name="가격", value=price_text, inline=True)
             embed.add_field(name="작성시각", value=_format_posted_at(deal.get("posted_at")), inline=True)
             if deal.get("product_url"):
-                embed.add_field(name="상품 URL", value=deal["product_url"], inline=False)
-            embed.add_field(name="페이지", value=deal["link"], inline=False)
+                embed.add_field(name="상품 URL", value=_truncate_text(deal["product_url"], DISCORD_FIELD_VALUE_LIMIT), inline=False)
+            embed.add_field(name="페이지", value=_truncate_text(deal["link"], DISCORD_FIELD_VALUE_LIMIT), inline=False)
             embeds.append(embed)
 
         msg = f"🔎 최근 {SEARCH_WINDOW_DAYS}일 기준 **{keyword}** 검색 결과 {len(matched)}건 중 {shown}건을 보여드립니다."
         msg += f"\n(정렬 기준: {sort})"
         msg += f"\n(스캔 게시글: {len(all_deals)}건)"
-        if ppomppu_ollama_enriched:
-            msg += f"\n(뽐뿌 {ppomppu_ollama_enriched}건은 gemma4로 상품명/가격/URL을 보강함)"
-        if crawl_errors:
-            msg += "\n⚠️ 일부 사이트 수집 실패: " + " | ".join(crawl_errors)
+        if ppomppu_openclaw_enriched:
+            msg += f"\n(뽐뿌 {ppomppu_openclaw_enriched}건은 {PPOMPPU_PRODUCT_PARSER_DISPLAY_NAME}로 상품명/가격/URL을 보강함)"
+        msg = _append_crawl_errors(msg, crawl_errors)
         await interaction.followup.send(msg, embeds=embeds)
 
 # =======================================================

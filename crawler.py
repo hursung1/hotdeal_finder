@@ -4,6 +4,8 @@ import base64
 import asyncio
 import datetime
 import hashlib
+import subprocess
+import tempfile
 import time
 import threading
 import requests
@@ -37,10 +39,14 @@ PPOMPPU_BOARD_CONFIGS = [
     {"id": "pmarket", "name": "쇼핑뽐뿌"},
 ]
 PPOMPPU_BOARD_NAME_BY_ID = {config["id"]: config["name"] for config in PPOMPPU_BOARD_CONFIGS}
-PPOMPPU_OLLAMA_MODEL = os.getenv("OLLAMA_PPOMPPU_MODEL", "gemma4:latest")
-PPOMPPU_OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://127.0.0.1:11434/api/generate")
-PPOMPPU_OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_PPOMPPU_TIMEOUT_SECONDS", "180"))
-PPOMPPU_OLLAMA_PARSE_CACHE_MAX = int(os.getenv("PPOMPPU_OLLAMA_PARSE_CACHE_MAX", "256"))
+PPOMPPU_OPENCLAW_COMMAND = os.getenv(
+    "OPENCLAW_COMMAND",
+    "/opt/homebrew/bin/openclaw" if os.path.exists("/opt/homebrew/bin/openclaw") else "openclaw",
+)
+PPOMPPU_OPENCLAW_MODEL = os.getenv("OPENCLAW_PPOMPPU_MODEL", "openai-codex/gpt-5.5")
+PPOMPPU_OPENCLAW_TIMEOUT_SECONDS = int(os.getenv("OPENCLAW_PPOMPPU_TIMEOUT_SECONDS", "180"))
+PPOMPPU_PRODUCT_PARSER_DISPLAY_NAME = f"OpenClaw {PPOMPPU_OPENCLAW_MODEL}"
+PPOMPPU_LLM_PARSE_CACHE_MAX = int(os.getenv("PPOMPPU_LLM_PARSE_CACHE_MAX", "256"))
 PPOMPPU_SHOPPING_HINTS = ("gmarket", "naver", "smartstore", "11st", "auction", "coupang", "linkprice")
 PPOMPPU_RECENT_CACHE_LOCK = threading.Lock()
 PPOMPPU_RECENT_CACHE = {
@@ -60,8 +66,8 @@ PPOMPPU_RECENT_CACHE = {
     "last_change_detected_at": None,
     "changed_boards": [],
 }
-PPOMPPU_OLLAMA_PARSE_CACHE_LOCK = threading.Lock()
-PPOMPPU_OLLAMA_PARSE_CACHE = {}
+PPOMPPU_LLM_PARSE_CACHE_LOCK = threading.Lock()
+PPOMPPU_LLM_PARSE_CACHE = {}
 
 
 def _fmkorea_is_blocked(status_code, soup):
@@ -516,6 +522,147 @@ def _parse_fmkorea_listing_items(soup, now_kst=None, cutoff_utc=None):
 
     return items, page_has_recent_post, len(anchors)
 
+
+def _extract_fmkorea_hotdeal_table_fields(soup):
+    table = soup.select_one("table.hotdeal_table")
+    if table is None:
+        return {}
+
+    fields = {}
+    for row in table.select("tr"):
+        label_cell = row.select_one("th")
+        value_cell = row.select_one("td")
+        if not label_cell or not value_cell:
+            continue
+
+        label = _normalize_title(label_cell.get_text(" ", strip=True))
+        if not label:
+            continue
+
+        value = _normalize_title(value_cell.get_text(" ", strip=True))
+        payload = {"text": value}
+
+        link_tag = value_cell.select_one("a[href]")
+        if link_tag:
+            payload["href"] = urljoin(FMKOREA_URL, link_tag.get("href"))
+
+        fields[label] = payload
+
+    return fields
+
+
+def _extract_fmkorea_post_title(soup):
+    for selector in (
+        ".rd_hd h1 > span",
+        ".board h1 > span",
+        ".top_area h1 > span",
+        "h1 > span",
+    ):
+        title_tag = soup.select_one(selector)
+        if title_tag:
+            title = _normalize_title(title_tag.get_text(" ", strip=True))
+            if title:
+                return title
+
+    if soup.title:
+        title = _normalize_title(soup.title.get_text(" ", strip=True))
+        title = re.sub(r"\s*-\s*핫딜\s*-\s*에펨코리아\s*$", "", title)
+        return title or None
+
+    return None
+
+
+def _extract_fmkorea_post_date_text(soup):
+    for selector in (
+        ".rd_hd span.date",
+        ".board.clear span.date",
+        ".top_area span.date",
+        "span.date",
+    ):
+        date_tag = soup.select_one(selector)
+        if not date_tag:
+            continue
+        date_text = _normalize_title(date_tag.get_text(" ", strip=True))
+        if date_text:
+            return date_text
+
+    return None
+
+
+def _clean_fmkorea_store_text(raw_text):
+    text = _normalize_title(raw_text)
+    text = re.sub(r"\s*\[[^\]]+\]\s*$", "", text)
+    return text or None
+
+
+def parse_fmkorea_post_detail(soup, post_url=None, now_kst=None):
+    fields = _extract_fmkorea_hotdeal_table_fields(soup)
+    title = _extract_fmkorea_post_title(soup)
+
+    product_name = fields.get("상품명", {}).get("text")
+    product_price_text = fields.get("가격", {}).get("text")
+    product_price = extract_price(product_price_text)
+    if product_price is None:
+        product_price = extract_price(title)
+    product_url = fields.get("링크", {}).get("href") or _extract_first_url(fields.get("링크", {}).get("text"))
+    seller = _clean_fmkorea_store_text(fields.get("쇼핑몰", {}).get("text"))
+    shipping = fields.get("배송", {}).get("text") or None
+
+    if not any((title, product_name, product_price_text, product_url, seller, shipping)):
+        return None
+
+    if now_kst is None:
+        now_kst = datetime.datetime.now(KST)
+
+    posted_at = parse_fmkorea_datetime(_extract_fmkorea_post_date_text(soup), now_kst)
+    post_link = normalize_link(FMKOREA_URL, post_url) if post_url else None
+
+    detail = {
+        "title": title or product_name,
+        "link": post_link,
+        "price": product_price,
+        "platform": "펨코",
+        "product_name": product_name,
+        "product_price_text": product_price_text,
+        "product_price": product_price,
+        "product_price_currency": "KRW" if product_price is not None else None,
+        "product_price_amount": product_price,
+        "product_url": product_url,
+        "seller": seller,
+        "shipping": shipping,
+        "source_post_url": post_link,
+    }
+
+    if posted_at is not None:
+        detail["posted_at"] = _to_aware_utc(posted_at)
+
+    return detail
+
+
+def _extract_fmkorea_product_detail_with_client(client, post_url):
+    res = client.get(post_url, headers=HEADERS, timeout=20)
+    res.raise_for_status()
+    soup = BeautifulSoup(res.text, "html.parser")
+    if _fmkorea_is_blocked(res.status_code, soup):
+        raise ValueError("펨코 보안 시스템 페이지가 표시되어 게시글을 파싱할 수 없습니다.")
+
+    detail = parse_fmkorea_post_detail(soup, post_url=post_url)
+    if detail is None:
+        raise ValueError("펨코 핫딜 상세 정보를 찾지 못했습니다.")
+    return detail
+
+
+def extract_fmkorea_product_detail(post_url):
+    try:
+        with requests.Session() as session:
+            return _extract_fmkorea_product_detail_with_client(session, post_url)
+    except (requests.RequestException, ValueError) as e:
+        print(f"펨코 상세 파싱: requests fetch 실패 ({e}), cloudscraper fallback 시도")
+
+    with cloudscraper.create_scraper() as scraper:
+        return _extract_fmkorea_product_detail_with_client(scraper, post_url)
+
+
 def normalize_link(base_url, href):
     if not href:
         return None
@@ -609,6 +756,8 @@ def _format_recent_search_stats(items_count, pages_scanned, elapsed_seconds, blo
 def _is_ppomppu_shop_link(href, text=""):
     href_lower = (href or "").lower()
     text_lower = (text or "").lower()
+    if "s.ppomppu.co.kr" in href_lower and "target=" in href_lower:
+        return True
     return any(hint in href_lower for hint in PPOMPPU_SHOPPING_HINTS) or any(
         hint in text_lower for hint in PPOMPPU_SHOPPING_HINTS
     )
@@ -776,12 +925,12 @@ def _parse_llm_price_text(price_text):
     return _parse_llm_price_metadata(price_text)["krw_value"]
 
 
-def _store_ppomppu_ollama_cache(cache_key, payload):
-    with PPOMPPU_OLLAMA_PARSE_CACHE_LOCK:
-        PPOMPPU_OLLAMA_PARSE_CACHE[cache_key] = dict(payload)
-        while len(PPOMPPU_OLLAMA_PARSE_CACHE) > PPOMPPU_OLLAMA_PARSE_CACHE_MAX:
-            oldest_key = next(iter(PPOMPPU_OLLAMA_PARSE_CACHE))
-            PPOMPPU_OLLAMA_PARSE_CACHE.pop(oldest_key, None)
+def _store_ppomppu_llm_cache(cache_key, payload):
+    with PPOMPPU_LLM_PARSE_CACHE_LOCK:
+        PPOMPPU_LLM_PARSE_CACHE[cache_key] = dict(payload)
+        while len(PPOMPPU_LLM_PARSE_CACHE) > PPOMPPU_LLM_PARSE_CACHE_MAX:
+            oldest_key = next(iter(PPOMPPU_LLM_PARSE_CACHE))
+            PPOMPPU_LLM_PARSE_CACHE.pop(oldest_key, None)
 
 
 def _pick_ppomppu_post_body_table(soup):
@@ -927,7 +1076,84 @@ def _select_ppomppu_keyword_block(sequence, global_links, keyword):
     }
 
 
-def _prepare_ppomppu_ollama_payload(post_url, keyword):
+def _ppomppu_image_suffix(image_url, response):
+    content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].lower().strip()
+    if content_type == "image/png":
+        return ".png"
+    if content_type == "image/webp":
+        return ".webp"
+    if content_type == "image/gif":
+        return ".gif"
+    if content_type in ("image/jpeg", "image/jpg"):
+        return ".jpg"
+
+    path = urlsplit(image_url).path.lower()
+    for suffix in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+        if path.endswith(suffix):
+            return suffix
+    return ".jpg"
+
+
+def _extract_openclaw_output_text(raw_stdout):
+    text = (raw_stdout or "").strip()
+    if not text:
+        return None
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+    if isinstance(payload, dict):
+        outputs = payload.get("outputs")
+        if isinstance(outputs, list):
+            for item in outputs:
+                if isinstance(item, dict) and item.get("text"):
+                    return item["text"]
+        if payload.get("text"):
+            return payload["text"]
+
+    return text
+
+
+def _run_ppomppu_openclaw_model(prompt, image_inputs):
+    with tempfile.TemporaryDirectory(prefix="ppomppu-openclaw-") as temp_dir:
+        command = [
+            PPOMPPU_OPENCLAW_COMMAND,
+            "infer",
+            "model",
+            "run",
+            "--gateway",
+            "--model",
+            PPOMPPU_OPENCLAW_MODEL,
+            "--prompt",
+            prompt,
+            "--json",
+        ]
+
+        for idx, image_input in enumerate(image_inputs, start=1):
+            image_path = os.path.join(temp_dir, f"image_{idx}{image_input['suffix']}")
+            with open(image_path, "wb") as file:
+                file.write(image_input["content"])
+            command.extend(["--file", image_path])
+
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=PPOMPPU_OPENCLAW_TIMEOUT_SECONDS,
+            check=False,
+        )
+
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        first_line = next((line.strip() for line in detail.splitlines() if line.strip()), "")
+        raise ValueError(f"OpenClaw 파싱 실패: {first_line or completed.returncode}")
+
+    return _extract_openclaw_output_text(completed.stdout)
+
+
+def _prepare_ppomppu_openclaw_payload(post_url, keyword):
     response = requests.get(post_url, headers=HEADERS, timeout=20)
     response.raise_for_status()
     response.encoding = "euc-kr"
@@ -952,79 +1178,73 @@ def _prepare_ppomppu_ollama_payload(post_url, keyword):
     else:
         lines.append("- (없음)")
 
-    image_payloads = []
+    image_inputs = []
     for item in block["image_items"]:
         image_url = item["value"]
         image_response = requests.get(image_url, headers=HEADERS, timeout=20)
         image_response.raise_for_status()
-        image_payloads.append(base64.b64encode(image_response.content).decode())
+        image_inputs.append({
+            "content": image_response.content,
+            "suffix": _ppomppu_image_suffix(image_url, image_response),
+        })
 
     candidate_url = None
     if block["link_items"]:
         candidate_url = block["link_items"][0]["value"]
 
-    prompt = (
-        "너는 핫딜 게시글에서 사용자의 검색어에 해당하는 상품 정보를 추출하는 모델이다.\n\n"
-        "입력 데이터:\n"
-        "- 사용자의 검색어\n"
-        "- 게시글 내용\n"
-        "- 검색어와 가까운 본문 블록에 붙은 상품 이미지들\n\n"
-        "목표:\n"
-        "사용자의 검색어에 해당하는 상품 1개에 대해 아래 3개 필드만 추출하라.\n"
-        "- product_name\n"
-        "- product_price\n"
-        "- product_url\n\n"
-        "추출 규칙:\n"
-        "1. 검색어와 관련된 상품만 대상으로 한다.\n"
-        "2. 각 필드는 게시글 내용에 명시되어 있으면 그것을 우선 사용한다.\n"
-        "3. 게시글 내용에 해당 필드가 없을 때만 이미지를 보고 보완한다.\n"
-        "4. 게시글 제목도 게시글 내용의 일부로 간주한다.\n"
-        "5. 게시글 내용에 URL이 여러 개면, 검색어 대상 상품 설명과 가장 가깝거나 직접 연결되는 URL을 선택한다.\n"
-        "6. 가격은 원문에 보이는 값만 사용한다. 추정하지 마라.\n"
-        "7. 이미지에 가격이 여러 개 있으면 결제할인가, 최종혜택가, 최종가처럼 실제 구매자 결제 금액에 가장 가까운 값을 우선한다.\n"
-        "8. 검색어와 무관한 다른 상품, 사은품, 주변기기, 부가 설명은 무시한다.\n"
-        "9. 어떤 필드도 확인할 수 없으면 null로 둔다.\n"
-        "10. 반드시 strict JSON만 반환한다. 다른 설명은 금지한다.\n\n"
-        f"사용자 검색어:\n{keyword}\n\n"
-        f"게시글 URL:\n{post_url}\n\n"
-        f"게시글 내용:\n{chr(10).join(lines)}\n"
-    )
+    prompt = f"""### SYSTEM ROLE
+너는 멀티모달 정보를 분석하여 사용자의 검색 의도에 부합하는 제품 데이터만 추출하는 고성능 데이터 파서(Data Parser)이다.
+
+### TASK SEQUENCE
+1. **분석**: 입력된 [USER_QUERY]와 [POST_CONTENT] 및 [IMAGE_INFO]를 대조하라.
+2. **필터링**: 게시글 내용이나 이미지가 사용자의 질의와 연관성이 현저히 낮다고 판단되는 경우 (단순 광고, 다른 기종, 정보 불일치 등) 분석에서 제외하라.
+3. **추출**: 연관성이 높을 경우에만 아래 정보를 추출하라:
+   - product_name: 제품의 풀네임 (용량, 색상 포함)
+   - seller_url: 구매 가능한 웹 주소 (없을 시 "N/A")
+   - price: 통화 기호를 포함한 가격 정보
+4. **출력**: 반드시 지정된 JSON 형식만 출력하며, 텍스트 설명이나 사족은 절대 금지한다.
+
+### JSON STRUCTURE
+[
+  {{
+    "index": int,
+    "product_name": "string",
+    "seller_url": "string",
+    "price": "string"
+  }}
+]
+
+### INPUT DATA
+- USER_QUERY: {keyword}
+- POST_URL: {post_url}
+- POST_CONTENT: {chr(10).join(lines)}
+- IMAGE_INFO: 검색어 주변 이미지 {len(image_inputs)}장이 OpenClaw image file input으로 함께 첨부됨
+
+### RESPONSE (JSON ONLY)
+
+"""
 
     return {
         "prompt": prompt,
-        "images": image_payloads,
+        "images": image_inputs,
         "candidate_url": candidate_url,
     }
 
 
-def extract_ppomppu_product_with_ollama(post_url, keyword):
+def extract_ppomppu_product_with_openclaw(post_url, keyword):
     normalized_post_url = normalize_ppomppu_link(post_url, post_url) or post_url
     normalized_keyword = (keyword or "").replace(" ", "").lower().strip()
     if not normalized_keyword:
         return None
 
     cache_key = f"{normalized_post_url}|{normalized_keyword}"
-    with PPOMPPU_OLLAMA_PARSE_CACHE_LOCK:
-        cached = PPOMPPU_OLLAMA_PARSE_CACHE.get(cache_key)
+    with PPOMPPU_LLM_PARSE_CACHE_LOCK:
+        cached = PPOMPPU_LLM_PARSE_CACHE.get(cache_key)
         if cached is not None:
             return dict(cached)
 
-    payload = _prepare_ppomppu_ollama_payload(normalized_post_url, keyword)
-    response = requests.post(
-        PPOMPPU_OLLAMA_API_URL,
-        json={
-            "model": PPOMPPU_OLLAMA_MODEL,
-            "prompt": payload["prompt"],
-            "images": payload["images"],
-            "stream": False,
-            "format": "json",
-            "options": {"temperature": 0},
-        },
-        timeout=PPOMPPU_OLLAMA_TIMEOUT_SECONDS,
-    )
-    response.raise_for_status()
-
-    raw_response = response.json().get("response")
+    payload = _prepare_ppomppu_openclaw_payload(normalized_post_url, keyword)
+    raw_response = _run_ppomppu_openclaw_model(payload["prompt"], payload["images"])
     parsed_payload = _extract_json_payload(raw_response)
 
     if isinstance(parsed_payload, list):
@@ -1033,8 +1253,10 @@ def extract_ppomppu_product_with_ollama(post_url, keyword):
         parsed_payload = {}
 
     product_name = _clean_ppomppu_llm_text(parsed_payload.get("product_name"))
-    product_price_text = _clean_ppomppu_llm_text(parsed_payload.get("product_price"))
-    product_url = _extract_first_url(_clean_ppomppu_llm_text(parsed_payload.get("product_url")) or "")
+    product_price_text = _clean_ppomppu_llm_text(parsed_payload.get("product_price") or parsed_payload.get("price"))
+    product_url = _extract_first_url(
+        _clean_ppomppu_llm_text(parsed_payload.get("product_url") or parsed_payload.get("seller_url")) or ""
+    )
 
     if not product_url and payload["candidate_url"] and product_name:
         product_url = payload["candidate_url"]
@@ -1050,7 +1272,7 @@ def extract_ppomppu_product_with_ollama(post_url, keyword):
         "product_url": product_url,
         "source_post_url": normalized_post_url,
     }
-    _store_ppomppu_ollama_cache(cache_key, result)
+    _store_ppomppu_llm_cache(cache_key, result)
     return dict(result)
 
 def parse_ruliweb_datetime(raw_text, now_kst):
@@ -1096,6 +1318,12 @@ def parse_fmkorea_datetime(raw_text, now_kst):
     text = (raw_text or "").strip()
     if not text:
         return None
+
+    ymd_hm_match = re.fullmatch(r"(\d{4})[.-](\d{2})[.-](\d{2})\s+(\d{2}):(\d{2})", text)
+    if ymd_hm_match:
+        year, month, day, hour, minute = map(int, ymd_hm_match.groups())
+        local_dt = datetime.datetime(year, month, day, hour, minute, tzinfo=KST)
+        return local_dt.astimezone(UTC)
 
     hm_match = re.fullmatch(r"(\d{2}):(\d{2})", text)
     if hm_match:
